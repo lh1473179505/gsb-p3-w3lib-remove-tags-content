@@ -278,6 +278,13 @@ class TestRemoveTags:
 
 
 class TestRemoveTagsWithContent:
+    MIXED_DOCUMENT = (
+        'keep<span>S</span><div data-x="a>b"/>X'
+        '<script data-y="p<q">BAD</script><s>S2</s>tail'
+    )
+    MIXED_TAGS = ("div", "script", "s")
+    MIXED_RESULT = "keep<span>S</span>Xtail"
+
     def test_returns_unicode(self):
         # make sure it always return unicode
         assert isinstance(remove_tags_with_content(b"no tags"), str)
@@ -325,42 +332,68 @@ class TestRemoveTagsWithContent:
             == "<span></span>"
         )
 
-    @pytest.mark.xfail(
-        reason="the tag scan stops at a raw < inside a quoted attribute value",
-        strict=True,
-    )
-    def test_lt_in_quoted_attribute_value(self) -> None:
+    def test_mixed_document(self) -> None:
+        assert (
+            remove_tags_with_content(self.MIXED_DOCUMENT, which_ones=self.MIXED_TAGS)
+            == self.MIXED_RESULT
+        )
+
+    def test_mixed_document_empty_which_ones(self) -> None:
+        assert remove_tags_with_content(self.MIXED_DOCUMENT) == self.MIXED_DOCUMENT
+        assert (
+            remove_tags_with_content(self.MIXED_DOCUMENT, which_ones=())
+            == self.MIXED_DOCUMENT
+        )
+
+    def test_mixed_document_bytes_with_encoding(self) -> None:
         assert (
             remove_tags_with_content(
-                'head<div data-x="a<b">c</div>tail', which_ones=("div",)
+                self.MIXED_DOCUMENT.encode("utf-8"),
+                which_ones=self.MIXED_TAGS,
+                encoding="utf-8",
+            )
+            == self.MIXED_RESULT
+        )
+
+        document = "café" + self.MIXED_DOCUMENT
+        assert (
+            remove_tags_with_content(
+                document.encode("latin-1"),
+                which_ones=self.MIXED_TAGS,
+                encoding="latin-1",
+            )
+            == "café" + self.MIXED_RESULT
+        )
+
+    @pytest.mark.parametrize("quote", ["'", '"'])
+    @pytest.mark.parametrize("char", ["<", ">"])
+    def test_angle_bracket_in_quoted_attribute_value(
+        self, quote: str, char: str
+    ) -> None:
+        assert (
+            remove_tags_with_content(
+                f"head<div data-x={quote}a{char}b{quote}>c</div>tail",
+                which_ones=("div",),
             )
             == "headtail"
         )
 
-    def test_gt_in_quoted_attribute_value(self) -> None:
-        # The tag scan ends the opening tag at the quoted ">",
-        # but the content scan then swallows the 'b">c' it left behind, so
-        # this case comes out right anyway.
+    @pytest.mark.parametrize("quote", ["'", '"'])
+    @pytest.mark.parametrize("char", ["<", ">"])
+    def test_angle_bracket_in_quoted_attribute_value_self_closing(
+        self, quote: str, char: str
+    ) -> None:
         assert (
             remove_tags_with_content(
-                'head<div data-x="a>b">c</div>tail', which_ones=("div",)
+                f"head<div data-x={quote}a{char}b{quote}/>tail",
+                which_ones=("div",),
             )
             == "headtail"
-        )
-
-    @pytest.mark.xfail(
-        reason="the tag scan stops at a raw > inside a quoted attribute value",
-        strict=True,
-    )
-    def test_gt_in_quoted_attribute_value_self_closing(self) -> None:
-        assert (
-            remove_tags_with_content('<div data-x="a>b"/>tail', which_ones=("div",))
-            == "tail"
         )
 
     def test_no_catastrophic_backtracking(self) -> None:
         # "<script " has no ">", so it never completes an opening tag and the
-        # close-tag scan is never entered
+        # scan must leave it unchanged without repeatedly scanning to EOF.
         evil = "<script " * 50000
         start = time.process_time()
         assert remove_tags_with_content(evil, which_ones=("script",)) == evil
@@ -372,11 +405,10 @@ class TestRemoveTagsWithContent:
         )
         assert time.process_time() - start < 2
 
-    @pytest.mark.xfail(reason="the close-tag scan restarts at every opening tag")
     def test_no_catastrophic_backtracking_unclosed_tags(self) -> None:
-        # Many *complete* opening tags with no closing tag: the close-tag scan
-        # runs to end-of-input from every one of them.
-        evil = "<script>" * 10000  # increase when fixing
+        # Many *complete* opening tags with no closing tag must not make the
+        # close-tag scan run to end-of-input from every one of them.
+        evil = "<script>" * 10000
         start = time.process_time()
         assert remove_tags_with_content(evil, which_ones=("script",)) == evil
         assert time.process_time() - start < 1

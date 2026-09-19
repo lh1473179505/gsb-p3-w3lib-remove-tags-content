@@ -1,6 +1,14 @@
 w3lib release notes
 ===================
 
+Unreleased
+----------
+
+- :func:`w3lib.html.remove_tags_with_content` now scans tags linearly and
+  understands quoted attribute values, so angle brackets inside attributes do
+  not truncate self-closing or paired tags, and repeated unclosed opening tags
+  no longer cause quadratic scans.
+
 2.4.1 (2026-03-20)
 ------------------
 

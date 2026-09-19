@@ -300,21 +300,69 @@ def remove_tags(
     )
 
 
-@functools.lru_cache(maxsize=256)
-def _build_remove_tags_pattern(tags_tuple: tuple[str, ...]) -> re.Pattern[str]:
-    tags = "|".join(re.escape(tag) for tag in tags_tuple)
-    # The end tag closes on the tag name followed by whitespace, "/" or ">",
-    # so `</script >`, `</script\n>`, `</script/>` and `</script foo>` all end
-    # the element, as browsers treat them. Requiring a bare `</tag>` left the
-    # content (and anything it hides, e.g. a <meta refresh>) in place. The
-    # trailing run stays [^<>]* so it can't cross into the next tag and match
-    # super-linearly.
-    pattern = rf"""
-        <(?P<tag>{tags})\b[^<>]*>.*?</(?P=tag)(?=[\s/>])[^<>]*>
-        |
-        <(?P<tag2>{tags})\b[^<>]*/>
+def _scan_tag(text: str, start: int) -> tuple[str, str, bool, int] | None:
+    """Scan the tag starting at ``start``.
+
+    Return ``(name, kind, self_closing, end)``, where ``kind`` is ``"open"``
+    or ``"close"`` and ``end`` is the position just after the tag. Quoted
+    attribute values may contain angle brackets. Return ``None`` if another
+    tag starts before this one is complete, and an ``"incomplete"`` result if
+    it runs to the end of the text without a closing angle bracket.
     """
-    return re.compile(pattern, re.IGNORECASE | re.DOTALL | re.VERBOSE)
+    pos = start + 1
+    kind = "open"
+    if pos < len(text) and text[pos] == "/":
+        kind = "close"
+        pos += 1
+
+    name_start = pos
+    while pos < len(text) and text[pos] not in HTML5_WHITESPACE + "<>/":
+        pos += 1
+    if pos == name_start:
+        return None
+    name = text[name_start:pos].casefold()
+
+    quote = ""
+    last_significant = ""
+    while pos < len(text):
+        char = text[pos]
+        if quote:
+            if char == quote:
+                quote = ""
+        elif char == "<":
+            # A new tag starts before this one is complete. Treating the
+            # current "<" as text keeps malformed open tags unchanged and
+            # bounds the scan by the distance to the next "<".
+            return None
+        elif char in "'\"":
+            quote = char
+        elif char == ">":
+            return name, kind, last_significant == "/", pos + 1
+        elif char not in HTML5_WHITESPACE:
+            last_significant = char
+        pos += 1
+    return "", "incomplete", False, len(text)
+
+
+def _find_closing_tags(text: str, names: set[str]) -> dict[str, list[int]]:
+    """Return the end positions of closing tags for ``names``, in order."""
+    closings = {name: [] for name in names}
+    pos = 0
+    while True:
+        pos = text.find("<", pos)
+        if pos == -1:
+            break
+        scanned = _scan_tag(text, pos)
+        if scanned is None:
+            pos += 1
+            continue
+        found_name, kind, _, end = scanned
+        if kind == "incomplete":
+            break
+        if kind == "close" and found_name in names:
+            closings[found_name].append(end)
+        pos = end
+    return closings
 
 
 def remove_tags_with_content(
@@ -335,11 +383,59 @@ def remove_tags_with_content(
 
     utext = to_unicode(text, encoding)
 
-    if not which_ones:
+    tags = {tag.casefold() for tag in which_ones}
+    if not tags:
         return utext
 
-    pattern = _build_remove_tags_pattern(tuple(sorted(set(which_ones))))
-    return pattern.sub("", utext)
+    output: list[str] = []
+    pos = 0
+    closings = _find_closing_tags(utext, tags)
+    closing_indexes = {name: 0 for name in tags}
+    while True:
+        tag_start = utext.find("<", pos)
+        if tag_start == -1:
+            output.append(utext[pos:])
+            break
+        output.append(utext[pos:tag_start])
+
+        scanned = _scan_tag(utext, tag_start)
+        if scanned is None:
+            # Keep an unterminated tag unchanged. If another "<" follows, the
+            # next iteration can still recognize the tag that starts there.
+            output.append("<")
+            pos = tag_start + 1
+            continue
+
+        name, kind, self_closing, tag_end = scanned
+        if kind == "incomplete":
+            output.append(utext[tag_start:])
+            break
+        if kind == "close" or name not in tags:
+            output.append(utext[tag_start:tag_end])
+            pos = tag_end
+            continue
+
+        if self_closing:
+            pos = tag_end
+            continue
+
+        tag_closings = closings[name]
+        closing_index = closing_indexes[name]
+        while (
+            closing_index < len(tag_closings)
+            and tag_closings[closing_index] <= tag_end
+        ):
+            closing_index += 1
+        closing_indexes[name] = closing_index
+
+        if closing_index == len(tag_closings):
+            output.append(utext[tag_start:tag_end])
+            pos = tag_end
+        else:
+            closing_indexes[name] = closing_index + 1
+            pos = tag_closings[closing_index]
+
+    return "".join(output)
 
 
 def replace_escape_chars(
