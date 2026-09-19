@@ -1,6 +1,22 @@
 w3lib release notes
 ===================
 
+unreleased
+----------
+
+- :func:`~w3lib.html.remove_tags_with_content` now scans tags instead of
+  matching them with a regular expression:
+
+  - ``<`` and ``>`` inside quoted attribute values no longer truncate the
+    tag, so e.g. ``<div data-x="a>b"/>`` and ``<div data-x="a<b">c</div>``
+    are removed as a whole.
+  - Self-closing tags (``<br/>``) and paired tags are both handled while
+    scanning the document once, and tag names that share a prefix are not
+    confused (``s`` does not match ``span``, #114).
+  - Documents with many opening tags and no end tag (e.g. ``"<script>" *
+    N``) are now scanned in linear time instead of quadratic time; an
+    opening tag that cannot be completed is still kept as-is.
+
 2.4.1 (2026-03-20)
 ------------------
 

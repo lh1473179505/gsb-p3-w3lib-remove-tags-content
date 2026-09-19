@@ -300,21 +300,82 @@ def remove_tags(
     )
 
 
+# A tag name ends at HTML5 whitespace, "/" or ">".
+_TAG_NAME_END = HTML5_WHITESPACE + "/>"
+
+
+def _parse_tag(text: str, start: int) -> tuple[str, int, bool, bool] | None:
+    """Parse the tag that starts at ``text[start] == "<"``.
+
+    Return ``(name, end, is_closing, is_self_closing)``, where ``name`` is the
+    lowercased tag name and ``end`` the index just past the closing ``>``.
+
+    Return ``None`` when there is no complete tag at *start*: a ``<`` not
+    followed by a tag name, or a tag left unterminated by a ``<`` (outside of
+    quotes) or by the end of the text. Attribute values quoted with ``"`` or
+    ``'`` may contain ``<`` and ``>``.
+    """
+    n = len(text)
+    i = start + 1
+    is_closing = False
+    if i < n and text[i] == "/":
+        is_closing = True
+        i += 1
+    if i >= n or not (text[i].isascii() and text[i].isalpha()):
+        return None
+    name_start = i
+    while i < n and text[i] not in _TAG_NAME_END:
+        if text[i] == "<":
+            return None
+        i += 1
+    if i >= n:
+        return None
+    name = text[name_start:i].lower()
+    # The rest of the tag, up to ">" outside of quoted attribute values.
+    while i < n:
+        c = text[i]
+        if c == ">":
+            return name, i + 1, is_closing, not is_closing and text[i - 1] == "/"
+        if c == "<":
+            return None
+        if c == '"' or c == "'":
+            quote_end = text.find(c, i + 1)
+            if quote_end == -1:
+                return None
+            i = quote_end + 1
+        else:
+            i += 1
+    return None
+
+
 @functools.lru_cache(maxsize=256)
-def _build_remove_tags_pattern(tags_tuple: tuple[str, ...]) -> re.Pattern[str]:
-    tags = "|".join(re.escape(tag) for tag in tags_tuple)
+def _build_close_tag_pattern(tag: str) -> re.Pattern[str]:
     # The end tag closes on the tag name followed by whitespace, "/" or ">",
     # so `</script >`, `</script\n>`, `</script/>` and `</script foo>` all end
-    # the element, as browsers treat them. Requiring a bare `</tag>` left the
-    # content (and anything it hides, e.g. a <meta refresh>) in place. The
-    # trailing run stays [^<>]* so it can't cross into the next tag and match
-    # super-linearly.
-    pattern = rf"""
-        <(?P<tag>{tags})\b[^<>]*>.*?</(?P=tag)(?=[\s/>])[^<>]*>
-        |
-        <(?P<tag2>{tags})\b[^<>]*/>
-    """
-    return re.compile(pattern, re.IGNORECASE | re.DOTALL | re.VERBOSE)
+    # the element, as browsers treat them. Requiring a bare `</tag>` would
+    # leave the content (and anything it hides, e.g. a <meta refresh>) in
+    # place. re.ASCII keeps the match ASCII-only, so e.g. "s" does not pair
+    # with "\u017f".
+    return re.compile(
+        rf"</{re.escape(tag)}(?=[\s/>])", re.IGNORECASE | re.ASCII
+    )
+
+
+def _find_close_tag(
+    text: str, tag: str, pattern: re.Pattern[str], pos: int
+) -> int | None:
+    """Return the index just past the ``</tag>`` end tag at or after *pos*,
+    or ``None`` if there is none before the end of the text."""
+    while m := pattern.search(text, pos):
+        parsed = _parse_tag(text, m.start())
+        if parsed is not None:
+            name, end, is_closing, _ = parsed
+            if is_closing and name == tag:
+                return end
+        # Not a complete end tag (e.g. a "<" or the end of the text cut it
+        # short): keep looking past it.
+        pos = m.start() + 1
+    return None
 
 
 def remove_tags_with_content(
@@ -338,8 +399,50 @@ def remove_tags_with_content(
     if not which_ones:
         return utext
 
-    pattern = _build_remove_tags_pattern(tuple(sorted(set(which_ones))))
-    return pattern.sub("", utext)
+    tags = {tag.lower() for tag in which_ones}
+    close_patterns = {tag: _build_close_tag_pattern(tag) for tag in tags}
+
+    # Scan the document once. A target opening tag removes itself and, for a
+    # non-self-closing tag, everything up to its end tag; a target tag with
+    # no end tag before the end of the text is kept as-is, and remembering
+    # that keeps the scan of many unclosed tags linear instead of rescanning
+    # to the end of the text for each of them.
+    out = []
+    pos = 0
+    unclosed: set[str] = set()
+    while pos < len(utext):
+        start = utext.find("<", pos)
+        if start == -1:
+            out.append(utext[pos:])
+            break
+        parsed = _parse_tag(utext, start)
+        if parsed is None:
+            # Not a complete tag: keep the "<" and rescan from after it.
+            out.append(utext[pos : start + 1])
+            pos = start + 1
+            continue
+        name, end, is_closing, is_self_closing = parsed
+        if is_closing or name not in tags:
+            out.append(utext[pos:end])
+            pos = end
+            continue
+        if is_self_closing:
+            out.append(utext[pos:start])
+            pos = end
+            continue
+        close_end = (
+            None
+            if name in unclosed
+            else _find_close_tag(utext, name, close_patterns[name], end)
+        )
+        if close_end is None:
+            unclosed.add(name)
+            out.append(utext[pos:end])
+            pos = end
+            continue
+        out.append(utext[pos:start])
+        pos = close_end
+    return "".join(out)
 
 
 def replace_escape_chars(

@@ -325,10 +325,87 @@ class TestRemoveTagsWithContent:
             == "<span></span>"
         )
 
-    @pytest.mark.xfail(
-        reason="the tag scan stops at a raw < inside a quoted attribute value",
-        strict=True,
+    def test_mixed_document(self) -> None:
+        # One document mixing a self-closing tag, paired tags, quoted "<"
+        # and ">" in attribute values, and tag names that share a prefix
+        # ("span" must not be matched by the "s" rule, #114).
+        doc = (
+            'keep<span>S</span><div data-x="a>b"/>X'
+            '<script data-y="p<q">BAD</script><s>S2</s>tail'
+        )
+        assert (
+            remove_tags_with_content(doc, which_ones=("div", "script", "s"))
+            == "keep<span>S</span>Xtail"
+        )
+
+    def test_mixed_document_bytes_with_encoding(self) -> None:
+        # bytes input decoded with an explicit encoding behaves like str.
+        doc = (
+            'keepé<span>S</span><div data-x="a>b"/>X'
+            '<script data-y="p<q">BAD</script><s>S2</s>tail'
+        )
+        expected = "keepé<span>S</span>Xtail"
+        for encoding in ("utf-8", "latin-1", "utf-16"):
+            assert (
+                remove_tags_with_content(
+                    doc.encode(encoding),
+                    which_ones=("div", "script", "s"),
+                    encoding=encoding,
+                )
+                == expected
+            )
+
+    @pytest.mark.parametrize(
+        ("doc", "expected"),
+        [
+            # ">" inside a quoted attribute value of a self-closing tag
+            pytest.param(
+                '<div data-x="a>b"/>tail', "tail", id="self-closing-gt-double"
+            ),
+            pytest.param(
+                "<div data-x='a>b'/>tail", "tail", id="self-closing-gt-single"
+            ),
+            # "<" inside a quoted attribute value of a self-closing tag
+            pytest.param(
+                '<div data-x="a<b"/>tail', "tail", id="self-closing-lt-double"
+            ),
+            pytest.param(
+                "<div data-x='a<b'/>tail", "tail", id="self-closing-lt-single"
+            ),
+            # "<" inside a quoted attribute value of a paired opening tag
+            pytest.param(
+                'head<div data-x="a<b">c</div>tail',
+                "headtail",
+                id="paired-lt-double",
+            ),
+            pytest.param(
+                "head<div data-x='a<b'>c</div>tail",
+                "headtail",
+                id="paired-lt-single",
+            ),
+            # ">" inside a quoted attribute value of a paired opening tag
+            pytest.param(
+                'head<div data-x="a>b">c</div>tail',
+                "headtail",
+                id="paired-gt-double",
+            ),
+            pytest.param(
+                "head<div data-x='a>b'>c</div>tail",
+                "headtail",
+                id="paired-gt-single",
+            ),
+        ],
     )
+    def test_brackets_in_quoted_attribute_values(
+        self, doc: str, expected: str
+    ) -> None:
+        assert remove_tags_with_content(doc, which_ones=("div",)) == expected
+
+    def test_empty_which_ones_keeps_input(self) -> None:
+        doc = 'keep<span>S</span><div data-x="a>b"/>X<script>BAD</script>tail'
+        assert remove_tags_with_content(doc) == doc
+        assert remove_tags_with_content(doc, which_ones=()) == doc
+
     def test_lt_in_quoted_attribute_value(self) -> None:
         assert (
             remove_tags_with_content(
@@ -348,10 +425,6 @@ class TestRemoveTagsWithContent:
             == "headtail"
         )
 
-    @pytest.mark.xfail(
-        reason="the tag scan stops at a raw > inside a quoted attribute value",
-        strict=True,
-    )
     def test_gt_in_quoted_attribute_value_self_closing(self) -> None:
         assert (
             remove_tags_with_content('<div data-x="a>b"/>tail', which_ones=("div",))
@@ -372,11 +445,10 @@ class TestRemoveTagsWithContent:
         )
         assert time.process_time() - start < 2
 
-    @pytest.mark.xfail(reason="the close-tag scan restarts at every opening tag")
     def test_no_catastrophic_backtracking_unclosed_tags(self) -> None:
-        # Many *complete* opening tags with no closing tag: the close-tag scan
-        # runs to end-of-input from every one of them.
-        evil = "<script>" * 10000  # increase when fixing
+        # Many *complete* opening tags with no closing tag: the close-tag
+        # scan must not run to end-of-input from every one of them.
+        evil = "<script>" * 100000
         start = time.process_time()
         assert remove_tags_with_content(evil, which_ones=("script",)) == evil
         assert time.process_time() - start < 1
